@@ -1,0 +1,501 @@
+#!/usr/bin/env python3
+"""getproblem - fetch a Codeforces problem statement + samples to the clipboard.
+
+Usage:
+    getproblem 1831B
+    getproblem 1831/B
+    getproblem 1800F2
+    getproblem 1831B --print     # copy AND print to stdout
+    getproblem 1831B --stdout    # print only, no clipboard
+    getproblem 1831B --samples-only
+    getproblem 1831B --refresh   # bypass the HTML cache
+    getproblem 1831B --raw       # keep $$$...$$$ math delimiters
+"""
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from urllib.parse import urljoin
+
+from bs4 import BeautifulSoup, NavigableString
+
+BASE = "https://codeforces.com"
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+TIMEOUT = 15
+RETRIES = 2  # retries after the first attempt
+
+try:
+    from curl_cffi import requests as cffi_requests
+
+    HAVE_CFFI = True
+except Exception:  # pragma: no cover - optional dependency
+    cffi_requests = None
+    HAVE_CFFI = False
+
+try:
+    import requests as plain_requests
+
+    HAVE_REQUESTS = True
+except Exception:  # pragma: no cover - optional dependency
+    plain_requests = None
+    HAVE_REQUESTS = False
+
+
+class GetProblemError(Exception):
+    """Raised for any user-facing failure."""
+
+
+# --------------------------------------------------------------------------- #
+# Fetching
+# --------------------------------------------------------------------------- #
+def _request(client, url):
+    if client == "cffi":
+        return cffi_requests.get(url, impersonate="chrome", timeout=TIMEOUT)
+    return plain_requests.get(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        timeout=TIMEOUT,
+    )
+
+
+def _looks_blocked(text):
+    # Only the genuine Cloudflare interstitial / challenge page, not regular
+    # Codeforces pages (which reference cloudflare in their scripts).
+    markers = (
+        "Just a moment",
+        "cf-challenge",
+        "Enable JavaScript and cookies to continue",
+        "Attention Required! | Cloudflare",
+    )
+    low = text.lower()
+    return any(m.lower() in low for m in markers)
+
+
+def fetch_html(url):
+    """Return (html, final_url, blocked) or raise GetProblemError."""
+    clients = []
+    if HAVE_CFFI:
+        clients.append("cffi")
+    if HAVE_REQUESTS:
+        clients.append("requests")
+    if not clients:
+        raise GetProblemError(
+            "no HTTP client available (install 'curl_cffi' or 'requests')"
+        )
+
+    last_err = None
+    last_blocked = False
+    for client in clients:
+        for attempt in range(RETRIES + 1):
+            try:
+                resp = _request(client, url)
+                status = getattr(resp, "status_code", 0)
+                text = resp.text or ""
+                if status == 200 and text:
+                    last_blocked = _looks_blocked(text)
+                    return text, str(getattr(resp, "url", url)), last_blocked
+                last_err = f"HTTP {status} ({client})"
+                if status in (403, 429, 503) or (text and _looks_blocked(text)):
+                    last_blocked = True
+            except Exception as exc:  # network errors etc.
+                last_err = f"{client}: {exc}"
+            if attempt < RETRIES:
+                time.sleep(1)
+    if last_blocked:
+        raise GetProblemError(
+            "Codeforces blocked the request (Cloudflare). "
+            "Install curl_cffi: pip install curl_cffi"
+        )
+    raise GetProblemError(last_err or "request failed")
+
+
+def fetch_problem(contest, index):
+    """Try the contest URL, then the problemset URL. Returns html."""
+    urls = [
+        f"{BASE}/contest/{contest}/problem/{index}",
+        f"{BASE}/problemset/problem/{contest}/{index}",
+    ]
+    blocked = False
+    for url in urls:
+        try:
+            html, _final, was_blocked = fetch_html(url)
+        except GetProblemError as exc:
+            if "Cloudflare" in str(exc):
+                blocked = True
+            continue
+        if _has_statement(html):
+            return html, url
+        blocked = blocked or was_blocked
+
+    if blocked:
+        raise GetProblemError(
+            "Codeforces blocked the request (Cloudflare). "
+            "Try again, or ensure curl_cffi is installed: pip install curl_cffi"
+        )
+    raise GetProblemError(f"problem {contest}{index} not found")
+
+
+def _has_statement(html):
+    return "problem-statement" in html and (
+        BeautifulSoup(html, "html.parser").select_one("div.problem-statement")
+        is not None
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Cache
+# --------------------------------------------------------------------------- #
+def cache_path(contest, index):
+    root = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(root) / "getproblem" / f"{contest}{index}.html"
+
+
+def get_page(contest, index, refresh=False):
+    path = cache_path(contest, index)
+    if path.exists() and not refresh:
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError:
+            pass
+    html, _url = fetch_problem(contest, index)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(html, encoding="utf-8")
+    except OSError:
+        pass
+    return html
+
+
+# --------------------------------------------------------------------------- #
+# Parsing / rendering
+# --------------------------------------------------------------------------- #
+_INLINE_BLOCKS = {
+    "p", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "dt", "dd",
+    "td", "th", "caption", "figcaption", "summary", "address",
+}
+
+_CONTAINERS = {
+    "div", "section", "article", "li", "table", "thead", "tbody", "tfoot",
+    "tr", "dl", "form", "details", "figure", "main", "header", "footer",
+    "aside", "nav",
+}
+
+
+class Renderer:
+    """Convert a Codeforces HTML subtree to markdown-ish plain text."""
+
+    def __init__(self):
+        self.in_math = False
+
+    def _track_math(self, text):
+        if text.count("$$$") % 2 == 1:
+            self.in_math = not self.in_math
+
+    def inline(self, node):
+        out = []
+        for child in node.children:
+            if isinstance(child, NavigableString):
+                s = str(child)
+                self._track_math(s)
+                out.append(re.sub(r"\s+", " ", s))
+            elif child.name == "br":
+                out.append("\n")
+            elif child.name == "img":
+                src = child.get("src") or child.get("data-src") or ""
+                out.append(f"[image: {urljoin(BASE + '/', src)}]" if src else "[image]")
+            elif child.name in ("sub", "sup"):
+                inner = self.inline(child).strip()
+                if self.in_math:
+                    out.append(inner)
+                else:
+                    out.append(("_" if child.name == "sub" else "^") + inner)
+            else:
+                out.append(self.inline(child))
+        return re.sub(r"[ \t]{2,}", " ", "".join(out))
+
+    def blocks(self, container):
+        blocks = []
+        for child in container.children:
+            if isinstance(child, NavigableString):
+                s = self._track_text(child)
+                if s.strip():
+                    blocks.append(s.strip())
+            elif child.name == "pre":
+                blocks.append("```\n" + pre_text(child) + "\n```")
+            elif child.name in ("ul", "ol"):
+                items = []
+                for li in child.find_all("li", recursive=False):
+                    items.append("- " + self.inline(li).strip())
+                if items:
+                    blocks.append("\n".join(items))
+            elif child.name in _INLINE_BLOCKS:
+                s = self.inline(child).strip()
+                if s:
+                    blocks.append(s)
+            elif child.name in _CONTAINERS:
+                cls = child.get("class") or []
+                if "section-title" in cls:
+                    continue
+                sub = self.blocks(child)
+                if sub.strip():
+                    blocks.append(sub.strip())
+            elif child.name is not None:
+                s = self.inline(child).strip()
+                if s:
+                    blocks.append(s)
+        return "\n\n".join(b for b in blocks if b.strip())
+
+    def _track_text(self, child):
+        s = str(child)
+        self._track_math(s)
+        return re.sub(r"\s+", " ", s)
+
+
+def raw_text(node):
+    out = []
+    for child in node.children:
+        if isinstance(child, NavigableString):
+            out.append(str(child))
+        elif child.name == "br":
+            out.append("\n")
+        else:
+            out.append(raw_text(child))
+    return "".join(out)
+
+
+def pre_text(pre):
+    lines = pre.select("div.test-example-line")
+    if lines:
+        return "\n".join(raw_text(line).strip("\r\n") for line in lines)
+    txt = raw_text(pre)
+    if txt.startswith("\n"):
+        txt = txt[1:]
+    return txt.rstrip("\n")
+
+
+def header_prop(header, cls):
+    el = header.select_one(f".{cls}") if header else None
+    if el is None:
+        return ""
+    for title in el.select(".property-title"):
+        title.extract()
+    return re.sub(r"\s+", " ", el.get_text()).strip()
+
+
+def parse_problem(html, contest, index):
+    soup = BeautifulSoup(html, "html.parser")
+    ps = soup.select_one("div.problem-statement")
+    if ps is None:
+        raise GetProblemError(
+            "could not parse the problem statement (page layout changed or blocked)"
+        )
+
+    header = ps.select_one("div.header")
+    raw_title = header_prop(header, "title") if header else ""
+    raw_title = re.sub(r"^[A-Za-z]\d?\.\s*", "", raw_title).strip() or raw_title
+    time_limit = header_prop(header, "time-limit")
+    memory_limit = header_prop(header, "memory-limit")
+    input_file = header_prop(header, "input-file")
+    output_file = header_prop(header, "output-file")
+
+    legend = None
+    for div in ps.find_all("div", recursive=False):
+        cls = div.get("class") or []
+        if "header" in cls:
+            continue
+        if not cls:
+            legend = div
+            break
+
+    input_spec = ps.select_one("div.input-specification")
+    output_spec = ps.select_one("div.output-specification")
+    note = ps.select_one("div.note")
+
+    samples = []
+    for sample in ps.select("div.sample-test"):
+        ins = sample.select("div.input pre")
+        outs = sample.select("div.output pre")
+        count = max(len(ins), len(outs))
+        for i in range(count):
+            samples.append(
+                (
+                    pre_text(ins[i]) if i < len(ins) else "",
+                    pre_text(outs[i]) if i < len(outs) else "",
+                )
+            )
+
+    return {
+        "index": f"{contest}{index}",
+        "title": raw_title,
+        "time_limit": time_limit,
+        "memory_limit": memory_limit,
+        "input_file": input_file,
+        "output_file": output_file,
+        "statement": Renderer().blocks(legend) if legend else "",
+        "input_spec": Renderer().blocks(input_spec) if input_spec else "",
+        "output_spec": Renderer().blocks(output_spec) if output_spec else "",
+        "note": Renderer().blocks(note) if note else "",
+        "samples": samples,
+        "url": f"{BASE}/contest/{contest}/problem/{index}",
+    }
+
+
+def render_examples(samples):
+    blocks = []
+    for i, (sin, sout) in enumerate(samples, 1):
+        blocks.append(f"### Input {i}\n```\n{sin}\n```")
+        blocks.append(f"### Output {i}\n```\n{sout}\n```")
+    return "## Examples\n\n" + "\n\n".join(blocks)
+
+
+def latex_to_markdown(text):
+    """Convert Codeforces $$$...$$$ math delimiters to standard $...$."""
+    return re.sub(r"\$\$\$(.+?)\$\$\$", r"$\g<1>$", text, flags=re.DOTALL)
+
+
+def format_output(data, samples_only=False, raw=False):
+    if samples_only:
+        text = render_examples(data["samples"]) + "\n"
+        return text if raw else latex_to_markdown(text)
+
+    parts = [f"# {data['index']} - {data['title']}"]
+
+    limit = f"Time limit: {data['time_limit']} | Memory limit: {data['memory_limit']}"
+    if data["input_file"] and data["input_file"].lower() != "standard input":
+        limit += f" | Input: {data['input_file']}"
+    if data["output_file"] and data["output_file"].lower() != "standard output":
+        limit += f" | Output: {data['output_file']}"
+    parts.append(limit)
+
+    if data["statement"]:
+        parts.append("## Statement\n\n" + data["statement"])
+    if data["input_spec"]:
+        parts.append("## Input\n\n" + data["input_spec"])
+    if data["output_spec"]:
+        parts.append("## Output\n\n" + data["output_spec"])
+    if data["samples"]:
+        parts.append(render_examples(data["samples"]))
+    if data["note"]:
+        parts.append("## Note\n\n" + data["note"])
+    parts.append(f"URL: {data['url']}")
+
+    text = "\n\n".join(parts).rstrip() + "\n"
+    return text if raw else latex_to_markdown(text)
+
+
+# --------------------------------------------------------------------------- #
+# Clipboard
+# --------------------------------------------------------------------------- #
+def to_clipboard(text):
+    candidates = (["wl-copy"], ["xclip", "-selection", "clipboard"])
+    for cmd in candidates:
+        exe = shutil.which(cmd[0])
+        if not exe:
+            continue
+        try:
+            proc = subprocess.run(
+                [exe] + cmd[1:],
+                input=text.encode("utf-8"),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            continue
+        if proc.returncode == 0:
+            return cmd[0]
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+ID_RE = re.compile(r"^(\d+)/?([A-Za-z]\d?)$")
+
+USAGE = """usage: getproblem <id> [--print] [--stdout] [--refresh] [--samples-only] [--raw]
+
+  <id>   problem id, e.g. 1831B, 1831/B, 1800F2
+
+options:
+  --print          copy to the clipboard AND print to stdout
+  --stdout         print to stdout only (no clipboard)
+  --refresh        ignore the cached HTML and re-fetch
+  --samples-only   only output the sample inputs/outputs
+  --raw            keep the original $$$...$$$ math delimiters"""
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="getproblem", add_help=True, description="Fetch a Codeforces problem."
+    )
+    parser.add_argument("problem", help="problem id, e.g. 1831B or 1831/B")
+    parser.add_argument("--print", dest="also_print", action="store_true",
+                        help="copy to clipboard and also print to stdout")
+    parser.add_argument("--stdout", action="store_true",
+                        help="print to stdout only, no clipboard")
+    parser.add_argument("--refresh", action="store_true",
+                        help="bypass the HTML cache")
+    parser.add_argument("--samples-only", action="store_true",
+                        help="output only the sample inputs/outputs")
+    parser.add_argument("--raw", action="store_true",
+                        help="keep the original $$$...$$$ math delimiters")
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+
+    match = ID_RE.match(args.problem)
+    if not match:
+        print(USAGE, file=sys.stderr)
+        return 2
+
+    contest = match.group(1)
+    index = match.group(2).upper()
+
+    try:
+        html = get_page(contest, index, refresh=args.refresh)
+        data = parse_problem(html, contest, index)
+    except GetProblemError as exc:
+        print(f"getproblem: {exc}", file=sys.stderr)
+        return 1
+
+    text = format_output(data, samples_only=args.samples_only, raw=args.raw)
+
+    if args.stdout:
+        sys.stdout.write(text)
+        return 0
+
+    copied = to_clipboard(text)
+    if args.also_print:
+        sys.stdout.write(text)
+
+    if copied:
+        print(
+            f"Copied {data['index']} - {data['title']} ({len(data['samples'])} samples)",
+            file=sys.stderr,
+        )
+        return 0
+
+    print(
+        "getproblem: wl-copy/xclip not found; printing to stdout instead",
+        file=sys.stderr,
+    )
+    if not args.also_print:
+        sys.stdout.write(text)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
