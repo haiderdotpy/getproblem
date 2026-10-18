@@ -1,36 +1,54 @@
 #!/usr/bin/env python3
-"""getproblem - fetch a Codeforces problem statement + samples to the clipboard.
+"""getproblem - fetch a competitive-programming problem statement + samples
+to the clipboard.
+
+Supported platforms: Codeforces, AtCoder, LeetCode, CodeChef.
 
 Usage:
-    getproblem 1831B
+    getproblem 1831B            # Codeforces
     getproblem 1831/B
-    getproblem 1800F2
-    getproblem 1831B --print     # copy AND print to stdout
-    getproblem 1831B --stdout    # print only, no clipboard
+    getproblem cf:1A            # explicit platform prefix
+    getproblem abc300_a         # AtCoder
+    getproblem atc:abc300a
+    getproblem 1                # LeetCode (frontend number)
+    getproblem two-sum          # LeetCode (title slug)
+    getproblem FLOW001          # CodeChef
+    getproblem cc:FLOW001
+
+    getproblem 1831B --print         # copy AND print to stdout
+    getproblem 1831B --stdout        # print only, no clipboard
     getproblem 1831B --samples-only
-    getproblem 1831B --refresh   # bypass the HTML cache
-    getproblem 1831B --raw       # keep $$$...$$$ math delimiters
+    getproblem 1831B --refresh       # bypass the cache
+    getproblem 1831B --raw           # keep original math delimiters
 """
 
 import argparse
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import List, Optional, Tuple
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup, NavigableString
 
-BASE = "https://codeforces.com"
+CF_BASE = "https://codeforces.com"
+ATC_BASE = "https://atcoder.jp"
+LC_BASE = "https://leetcode.com"
+CC_BASE = "https://www.codechef.com"
+
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 TIMEOUT = 15
 RETRIES = 2  # retries after the first attempt
+LC_LIST_TTL = 7 * 24 * 3600  # LeetCode problem list cached for 7 days
 
 try:
     from curl_cffi import requests as cffi_requests
@@ -53,20 +71,53 @@ class GetProblemError(Exception):
     """Raised for any user-facing failure."""
 
 
+@dataclass
+class Problem:
+    platform: str
+    id: str
+    title: str
+    time_limit: Optional[str]
+    memory_limit: Optional[str]
+    statement: str
+    input_spec: Optional[str]
+    output_spec: Optional[str]
+    constraints: Optional[str]
+    samples: List[Tuple[str, str]] = field(default_factory=list)
+    note: Optional[str] = None
+    url: str = ""
+    # extra fields kept for backwards-compatible Codeforces output
+    input_file: Optional[str] = None
+    output_file: Optional[str] = None
+    frontend_id: Optional[str] = None
+
+    def __getitem__(self, key):  # tiny compatibility shim
+        return getattr(self, key)
+
+
 # --------------------------------------------------------------------------- #
-# Fetching
+# HTTP
 # --------------------------------------------------------------------------- #
-def _request(client, url):
+def _request(client, url, method="GET", headers=None, json_body=None):
     if client == "cffi":
-        return cffi_requests.get(url, impersonate="chrome", timeout=TIMEOUT)
-    return plain_requests.get(
+        return cffi_requests.request(
+            method,
+            url,
+            impersonate="chrome",
+            timeout=TIMEOUT,
+            headers=headers,
+            json=json_body,
+        )
+    return plain_requests.request(
+        method,
         url,
-        headers={
+        headers=headers
+        or {
             "User-Agent": USER_AGENT,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
         },
         timeout=TIMEOUT,
+        json=json_body,
     )
 
 
@@ -83,8 +134,12 @@ def _looks_blocked(text):
     return any(m.lower() in low for m in markers)
 
 
-def fetch_html(url):
-    """Return (html, final_url, blocked) or raise GetProblemError."""
+def request_raw(url, platform="Codeforces", method="GET", headers=None, json_body=None):
+    """Perform a request with retries and client fallback.
+
+    Returns ``(status, text, final_url, blocked)``. Only raises when every
+    client fails at the network level or the site is Cloudflare-blocked.
+    """
     clients = []
     if HAVE_CFFI:
         clients.append("cffi")
@@ -97,35 +152,298 @@ def fetch_html(url):
 
     last_err = None
     last_blocked = False
+    best = None
     for client in clients:
         for attempt in range(RETRIES + 1):
             try:
-                resp = _request(client, url)
+                resp = _request(
+                    client, url, method=method, headers=headers, json_body=json_body
+                )
                 status = getattr(resp, "status_code", 0)
                 text = resp.text or ""
+                final = str(getattr(resp, "url", url))
+                blocked = _looks_blocked(text) if text else False
                 if status == 200 and text:
-                    last_blocked = _looks_blocked(text)
-                    return text, str(getattr(resp, "url", url)), last_blocked
+                    return status, text, final, blocked
+                best = (status, text, final)
                 last_err = f"HTTP {status} ({client})"
-                if status in (403, 429, 503) or (text and _looks_blocked(text)):
+                if status in (403, 429, 503) or blocked:
                     last_blocked = True
+                if status in (400, 401, 404, 410):
+                    return status, text, final, last_blocked
             except Exception as exc:  # network errors etc.
                 last_err = f"{client}: {exc}"
             if attempt < RETRIES:
                 time.sleep(1)
+
     if last_blocked:
         raise GetProblemError(
-            "Codeforces blocked the request (Cloudflare). "
+            f"{platform} blocked the request (Cloudflare). "
             "Install curl_cffi: pip install curl_cffi"
         )
-    raise GetProblemError(last_err or "request failed")
+    if best is not None:
+        return best[0], best[1], best[2], False
+    raise GetProblemError(f"{platform}: {last_err or 'request failed'}")
+
+
+def fetch_html(url, platform="Codeforces", method="GET", headers=None, json_body=None):
+    """Return (html, final_url, blocked) or raise GetProblemError."""
+    status, text, final, blocked = request_raw(
+        url, platform=platform, method=method, headers=headers, json_body=json_body
+    )
+    if status == 200 and text:
+        return text, final, blocked
+    if blocked:
+        raise GetProblemError(
+            f"{platform} blocked the request (Cloudflare). "
+            "Install curl_cffi: pip install curl_cffi"
+        )
+    raise GetProblemError(f"{platform}: HTTP {status}")
+
+
+# --------------------------------------------------------------------------- #
+# Cache (per platform)
+# --------------------------------------------------------------------------- #
+def cache_root():
+    root = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(root) / "getproblem"
+
+
+def cache_path(platform, key, ext="html"):
+    return cache_root() / platform / f"{key}.{ext}"
+
+
+def write_cache(platform, key, content, ext="html"):
+    path = cache_path(platform, key, ext)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def get_cached(platform, key, fetch, ext="html", refresh=False):
+    path = cache_path(platform, key, ext)
+    if path.exists() and not refresh:
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError:
+            pass
+    content = fetch()
+    write_cache(platform, key, content, ext)
+    return content
+
+
+def migrate_flat_cache():
+    """Move legacy flat codeforces cache files into the per-platform dir."""
+    root = cache_root()
+    if not root.is_dir():
+        return
+    dest = root / "codeforces"
+    for old in root.glob("*.html"):
+        target = dest / old.name
+        try:
+            if target.exists():
+                old.unlink()
+            else:
+                dest.mkdir(parents=True, exist_ok=True)
+                old.replace(target)
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------- #
+# HTML -> text rendering
+# --------------------------------------------------------------------------- #
+_INLINE_BLOCKS = {
+    "p", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "dt", "dd",
+    "td", "th", "caption", "figcaption", "summary", "address",
+}
+
+_CONTAINERS = {
+    "div", "section", "article", "li", "table", "thead", "tbody", "tfoot",
+    "tr", "dl", "form", "details", "figure", "main", "header", "footer",
+    "aside", "nav",
+}
+
+
+def strip_math_wrappers(text):
+    text = text.strip()
+    if text.startswith("\\(") and text.endswith("\\)"):
+        text = text[2:-2].strip()
+    return text
+
+
+class HtmlRenderer:
+    """Convert an HTML subtree to markdown-ish plain text.
+
+    Defaults reproduce the original Codeforces behaviour:
+    ``$$$...$$$`` tracking, no ``<var>`` math, literal ``<code>``.
+    """
+
+    def __init__(
+        self,
+        image_base=CF_BASE,
+        var_math=False,
+        code_backticks=False,
+        track_math=False,
+    ):
+        self.image_base = image_base
+        self.var_math = var_math
+        self.code_backticks = code_backticks
+        self.track_math = track_math
+        self.in_math = False
+
+    def _track_math(self, text):
+        if self.track_math and text.count("$$$") % 2 == 1:
+            self.in_math = not self.in_math
+
+    def _inline_node(self, child):
+        if isinstance(child, NavigableString):
+            s = str(child)
+            self._track_math(s)
+            return re.sub(r"\s+", " ", s)
+        if child.name == "br":
+            return "\n"
+        if child.name == "img":
+            src = child.get("src") or child.get("data-src") or ""
+            return (
+                f"[image: {urljoin(self.image_base + '/', src)}]"
+                if src
+                else "[image]"
+            )
+        if child.name in ("sub", "sup"):
+            inner = self.inline(child).strip()
+            if self.track_math and self.in_math:
+                return inner
+            return ("_" if child.name == "sub" else "^") + inner
+        if child.name == "var":
+            inner = strip_math_wrappers(re.sub(r"\s+", " ", child.get_text())).strip()
+            return f"${inner}$" if self.var_math else inner
+        if child.name == "code":
+            inner = self.inline(child).strip()
+            return f"`{inner}`" if self.code_backticks else inner
+        return self.inline(child)
+
+    def inline(self, node):
+        out = [self._inline_node(child) for child in node.children]
+        text = re.sub(r"[ \t]{2,}", " ", "".join(out))
+        return re.sub(r"[ \t]*\n[ \t]*", "\n", text)
+
+    def blocks(self, container):
+        blocks = []
+        buf = []
+
+        def flush():
+            if not buf:
+                return
+            text = re.sub(r"[ \t]*\n[ \t]*", "\n", re.sub(r"[ \t]{2,}", " ", "".join(buf)))
+            text = text.strip()
+            if text:
+                blocks.append(text)
+            buf.clear()
+
+        for child in container.children:
+            if isinstance(child, NavigableString):
+                s = str(child)
+                self._track_math(s)
+                buf.append(re.sub(r"\s+", " ", s))
+            elif child.name == "br":
+                buf.append("\n")
+            elif child.name == "pre":
+                flush()
+                blocks.append("```\n" + pre_text(child, var_math=self.var_math) + "\n```")
+            elif child.name in ("ul", "ol"):
+                flush()
+                items = []
+                for li in child.find_all("li", recursive=False):
+                    items.append("- " + self.inline(li).strip())
+                if items:
+                    blocks.append("\n".join(items))
+            elif child.name in _INLINE_BLOCKS:
+                flush()
+                s = self.inline(child).strip()
+                if s:
+                    blocks.append(s)
+            elif child.name in _CONTAINERS:
+                cls = child.get("class") or []
+                if "section-title" in cls:
+                    continue
+                flush()
+                sub = self.blocks(child)
+                if sub.strip():
+                    blocks.append(sub.strip())
+            elif child.name is not None:
+                buf.append(self._inline_node(child))
+        flush()
+        return "\n\n".join(b for b in blocks if b.strip())
+
+
+def raw_text(node, var_math=False, raw=False):
+    out = []
+    for child in node.children:
+        if isinstance(child, NavigableString):
+            out.append(str(child))
+        elif child.name == "br":
+            out.append("\n")
+        elif child.name == "var" and var_math and not raw:
+            inner = strip_math_wrappers(raw_text(child)).strip()
+            out.append(f"${inner}$")
+        else:
+            out.append(raw_text(child, var_math=var_math, raw=raw))
+    return "".join(out)
+
+
+def pre_text(pre, var_math=False, raw=False):
+    lines = pre.select("div.test-example-line")
+    if lines:
+        return "\n".join(raw_text(line).strip("\r\n") for line in lines)
+    txt = raw_text(pre, var_math=var_math, raw=raw)
+    if txt.startswith("\n"):
+        txt = txt[1:]
+    return txt.rstrip("\n")
+
+
+def header_prop(header, cls):
+    el = header.select_one(f".{cls}") if header else None
+    if el is None:
+        return ""
+    for title in el.select(".property-title"):
+        title.extract()
+    return re.sub(r"\s+", " ", el.get_text()).strip()
+
+
+def render_html(html, *, image_base, var_math=False, code_backticks=False, track_math=False):
+    soup = BeautifulSoup(html, "html.parser")
+    return HtmlRenderer(
+        image_base=image_base,
+        var_math=var_math,
+        code_backticks=code_backticks,
+        track_math=track_math,
+    ).blocks(soup).strip()
+
+
+def render_nodes(nodes, *, image_base, var_math=False, code_backticks=False):
+    html = "".join(str(n) for n in nodes)
+    return render_html(
+        html,
+        image_base=image_base,
+        var_math=var_math,
+        code_backticks=code_backticks,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Codeforces
+# --------------------------------------------------------------------------- #
+ID_RE = re.compile(r"^(\d+)/?([A-Za-z]\d?)$")
 
 
 def fetch_problem(contest, index):
-    """Try the contest URL, then the problemset URL. Returns html."""
+    """Try the contest URL, then the problemset URL. Returns (html, url)."""
     urls = [
-        f"{BASE}/contest/{contest}/problem/{index}",
-        f"{BASE}/problemset/problem/{contest}/{index}",
+        f"{CF_BASE}/contest/{contest}/problem/{index}",
+        f"{CF_BASE}/problemset/problem/{contest}/{index}",
     ]
     blocked = False
     for url in urls:
@@ -154,161 +472,22 @@ def _has_statement(html):
     )
 
 
-# --------------------------------------------------------------------------- #
-# Cache
-# --------------------------------------------------------------------------- #
-def cache_path(contest, index):
-    root = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
-    return Path(root) / "getproblem" / f"{contest}{index}.html"
-
-
-def get_page(contest, index, refresh=False):
-    path = cache_path(contest, index)
-    if path.exists() and not refresh:
-        try:
-            return path.read_text(encoding="utf-8")
-        except OSError:
-            pass
-    html, _url = fetch_problem(contest, index)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(html, encoding="utf-8")
-    except OSError:
-        pass
-    return html
-
-
-# --------------------------------------------------------------------------- #
-# Parsing / rendering
-# --------------------------------------------------------------------------- #
-_INLINE_BLOCKS = {
-    "p", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "dt", "dd",
-    "td", "th", "caption", "figcaption", "summary", "address",
-}
-
-_CONTAINERS = {
-    "div", "section", "article", "li", "table", "thead", "tbody", "tfoot",
-    "tr", "dl", "form", "details", "figure", "main", "header", "footer",
-    "aside", "nav",
-}
-
-
-class Renderer:
-    """Convert a Codeforces HTML subtree to markdown-ish plain text."""
-
-    def __init__(self):
-        self.in_math = False
-
-    def _track_math(self, text):
-        if text.count("$$$") % 2 == 1:
-            self.in_math = not self.in_math
-
-    def inline(self, node):
-        out = []
-        for child in node.children:
-            if isinstance(child, NavigableString):
-                s = str(child)
-                self._track_math(s)
-                out.append(re.sub(r"\s+", " ", s))
-            elif child.name == "br":
-                out.append("\n")
-            elif child.name == "img":
-                src = child.get("src") or child.get("data-src") or ""
-                out.append(f"[image: {urljoin(BASE + '/', src)}]" if src else "[image]")
-            elif child.name in ("sub", "sup"):
-                inner = self.inline(child).strip()
-                if self.in_math:
-                    out.append(inner)
-                else:
-                    out.append(("_" if child.name == "sub" else "^") + inner)
-            else:
-                out.append(self.inline(child))
-        return re.sub(r"[ \t]{2,}", " ", "".join(out))
-
-    def blocks(self, container):
-        blocks = []
-        for child in container.children:
-            if isinstance(child, NavigableString):
-                s = self._track_text(child)
-                if s.strip():
-                    blocks.append(s.strip())
-            elif child.name == "pre":
-                blocks.append("```\n" + pre_text(child) + "\n```")
-            elif child.name in ("ul", "ol"):
-                items = []
-                for li in child.find_all("li", recursive=False):
-                    items.append("- " + self.inline(li).strip())
-                if items:
-                    blocks.append("\n".join(items))
-            elif child.name in _INLINE_BLOCKS:
-                s = self.inline(child).strip()
-                if s:
-                    blocks.append(s)
-            elif child.name in _CONTAINERS:
-                cls = child.get("class") or []
-                if "section-title" in cls:
-                    continue
-                sub = self.blocks(child)
-                if sub.strip():
-                    blocks.append(sub.strip())
-            elif child.name is not None:
-                s = self.inline(child).strip()
-                if s:
-                    blocks.append(s)
-        return "\n\n".join(b for b in blocks if b.strip())
-
-    def _track_text(self, child):
-        s = str(child)
-        self._track_math(s)
-        return re.sub(r"\s+", " ", s)
-
-
-def raw_text(node):
-    out = []
-    for child in node.children:
-        if isinstance(child, NavigableString):
-            out.append(str(child))
-        elif child.name == "br":
-            out.append("\n")
-        else:
-            out.append(raw_text(child))
-    return "".join(out)
-
-
-def pre_text(pre):
-    lines = pre.select("div.test-example-line")
-    if lines:
-        return "\n".join(raw_text(line).strip("\r\n") for line in lines)
-    txt = raw_text(pre)
-    if txt.startswith("\n"):
-        txt = txt[1:]
-    return txt.rstrip("\n")
-
-
-def header_prop(header, cls):
-    el = header.select_one(f".{cls}") if header else None
-    if el is None:
-        return ""
-    for title in el.select(".property-title"):
-        title.extract()
-    return re.sub(r"\s+", " ", el.get_text()).strip()
-
-
-def parse_problem(html, contest, index):
+def parse_cf(html, contest, index):
     soup = BeautifulSoup(html, "html.parser")
     ps = soup.select_one("div.problem-statement")
     if ps is None:
         raise GetProblemError(
-            "could not parse the problem statement (page layout changed or blocked)"
+            "Codeforces: could not parse the problem statement "
+            "(page layout changed or blocked)"
         )
 
     header = ps.select_one("div.header")
     raw_title = header_prop(header, "title") if header else ""
-    raw_title = re.sub(r"^[A-Za-z]\d?\.\s*", "", raw_title).strip() or raw_title
-    time_limit = header_prop(header, "time-limit")
-    memory_limit = header_prop(header, "memory-limit")
-    input_file = header_prop(header, "input-file")
-    output_file = header_prop(header, "output-file")
+    title = re.sub(r"^[A-Za-z]\d?\.\s*", "", raw_title).strip() or raw_title
+    time_limit = header_prop(header, "time-limit") or None
+    memory_limit = header_prop(header, "memory-limit") or None
+    input_file = header_prop(header, "input-file") or None
+    output_file = header_prop(header, "output-file") or None
 
     legend = None
     for div in ps.find_all("div", recursive=False):
@@ -336,22 +515,582 @@ def parse_problem(html, contest, index):
                 )
             )
 
-    return {
-        "index": f"{contest}{index}",
-        "title": raw_title,
-        "time_limit": time_limit,
-        "memory_limit": memory_limit,
-        "input_file": input_file,
-        "output_file": output_file,
-        "statement": Renderer().blocks(legend) if legend else "",
-        "input_spec": Renderer().blocks(input_spec) if input_spec else "",
-        "output_spec": Renderer().blocks(output_spec) if output_spec else "",
-        "note": Renderer().blocks(note) if note else "",
-        "samples": samples,
-        "url": f"{BASE}/contest/{contest}/problem/{index}",
+    return Problem(
+        platform="Codeforces",
+        id=f"{contest}{index}",
+        title=title,
+        time_limit=time_limit,
+        memory_limit=memory_limit,
+        statement=HtmlRenderer(track_math=True).blocks(legend) if legend else "",
+        input_spec=HtmlRenderer(track_math=True).blocks(input_spec) if input_spec else "",
+        output_spec=HtmlRenderer(track_math=True).blocks(output_spec) if output_spec else "",
+        constraints=None,
+        samples=samples,
+        note=HtmlRenderer(track_math=True).blocks(note) if note else "",
+        url=f"{CF_BASE}/contest/{contest}/problem/{index}",
+        input_file=input_file,
+        output_file=output_file,
+    )
+
+
+def fetch_cf(spec, refresh=False, raw=False):
+    match = ID_RE.match(spec)
+    if not match:
+        raise GetProblemError(f"Codeforces: invalid problem id '{spec}'")
+    contest = match.group(1)
+    index = match.group(2).upper()
+    html = get_cached(
+        "codeforces",
+        f"{contest}{index}",
+        lambda: fetch_problem(contest, index)[0],
+        ext="html",
+        refresh=refresh,
+    )
+    return parse_cf(html, contest, index)
+
+
+# --------------------------------------------------------------------------- #
+# AtCoder
+# --------------------------------------------------------------------------- #
+_ATC_RE = re.compile(r"^([a-z]+\d+)_?([a-z0-9]+)$")
+
+
+def normalize_atc(token):
+    match = _ATC_RE.match(token)
+    if match:
+        return f"{match.group(1)}_{match.group(2)}"
+    return token
+
+
+def _atc_url(contest, suffix):
+    return f"{ATC_BASE}/contests/{contest}/tasks/{contest}_{suffix}?lang=en"
+
+
+def _atc_fetch_task(contest, suffix, letter):
+    direct = _atc_url(contest, suffix)
+    try:
+        html = fetch_html(direct, platform="AtCoder")[0]
+        if BeautifulSoup(html, "html.parser").select_one("#task-statement"):
+            return html, direct
+    except GetProblemError as exc:
+        if "Cloudflare" in str(exc):
+            raise
+
+    tasks_url = f"{ATC_BASE}/contests/{contest}/tasks?lang=en"
+    try:
+        listing = fetch_html(tasks_url, platform="AtCoder")[0]
+    except GetProblemError:
+        raise GetProblemError(f"AtCoder: task {contest}_{suffix} not found")
+
+    soup = BeautifulSoup(listing, "html.parser")
+    wanted = letter.upper()
+    for row in soup.select("table tbody tr"):
+        cells = row.find_all("td")
+        link = row.find("a")
+        if not cells or link is None:
+            continue
+        if cells[0].get_text(strip=True).upper() == wanted:
+            href = link.get("href") or ""
+            url = urljoin(ATC_BASE + "/", href)
+            if "lang=" not in url:
+                url += ("&" if "?" in url else "?") + "lang=en"
+            try:
+                page = fetch_html(url, platform="AtCoder")[0]
+            except GetProblemError as exc:
+                raise GetProblemError(f"AtCoder: could not load {url}: {exc}")
+            return page, url
+
+    raise GetProblemError(f"AtCoder: task {contest}_{suffix} not found")
+
+
+def classify_atc_heading(heading):
+    key = heading.strip().lower()
+    if key.startswith("sample input") or heading.strip().startswith("入力例"):
+        return "sample-in"
+    if key.startswith("sample output") or heading.strip().startswith("出力例"):
+        return "sample-out"
+    if key == "problem statement" or heading.strip() == "問題文":
+        return "statement"
+    if key == "constraints" or heading.strip() == "制約":
+        return "constraints"
+    if key == "input" or heading.strip() == "入力":
+        return "input"
+    if key == "output" or heading.strip() == "出力":
+        return "output"
+    if key == "note" or heading.strip() == "注意":
+        return "note"
+    return None
+
+
+def parse_atc(html, spec, url, raw=False):
+    soup = BeautifulSoup(html, "html.parser")
+
+    title = ""
+    if soup.title:
+        title = soup.title.get_text(strip=True)
+    title = re.sub(r"^[A-Za-z]\d*\s*-\s*", "", title).strip() or title
+
+    time_limit = memory_limit = None
+    for p in soup.find_all("p"):
+        text = p.get_text(" ", strip=True)
+        match = re.search(
+            r"Time Limit:\s*([^/]+?)\s*/\s*Memory Limit:\s*(.+?)\s*$", text
+        )
+        if match:
+            time_limit = match.group(1).strip()
+            memory_limit = match.group(2).strip()
+            break
+
+    en = soup.select_one("#task-statement span.lang-en")
+    if en is None:
+        en = soup.select_one("#task-statement")
+    if en is None:
+        raise GetProblemError(
+            "AtCoder: could not parse the task statement (page layout changed)"
+        )
+
+    sections = {}
+    sample_in = {}
+    sample_out = {}
+    note_parts = []
+
+    for part in en.select("div.part"):
+        h3 = part.find(["h3", "h2"])
+        heading = h3.get_text(strip=True) if h3 else ""
+        if h3 is not None:
+            content = list(h3.next_siblings)
+        else:
+            content = list(part.children)
+        num = re.search(r"(\d+)", heading)
+        idx = int(num.group(1)) if num else None
+        key = classify_atc_heading(heading)
+        if key == "sample-in":
+            sample_in[idx if idx is not None else 1] = content
+        elif key == "sample-out":
+            sample_out[idx if idx is not None else 1] = content
+        elif key == "statement":
+            sections["statement"] = content
+        elif key == "constraints":
+            sections["constraints"] = content
+        elif key == "input":
+            sections["input"] = content
+        elif key == "output":
+            sections["output"] = content
+        elif key == "note":
+            note_parts.append(content)
+
+    def render(key):
+        nodes = sections.get(key)
+        if not nodes:
+            return None
+        return render_nodes(nodes, image_base=ATC_BASE, var_math=not raw) or None
+
+    def sample_pre(nodes):
+        if not nodes:
+            return ""
+        node_soup = BeautifulSoup("".join(str(n) for n in nodes), "html.parser")
+        pre = node_soup.find("pre")
+        if pre is not None:
+            return pre_text(pre, var_math=True, raw=raw).strip("\n")
+        return render_nodes(nodes, image_base=ATC_BASE, var_math=True)
+
+    indices = sorted(set(sample_in) | set(sample_out))
+    samples = [
+        (sample_pre(sample_in.get(i)), sample_pre(sample_out.get(i)))
+        for i in indices
+    ]
+
+    note = None
+    if note_parts:
+        rendered = [
+            render_nodes(nodes, image_base=ATC_BASE, var_math=not raw)
+            for nodes in note_parts
+        ]
+        note = "\n\n".join(r for r in rendered if r) or None
+
+    return Problem(
+        platform="AtCoder",
+        id=spec,
+        title=title,
+        time_limit=time_limit,
+        memory_limit=memory_limit,
+        statement=render("statement") or "",
+        input_spec=render("input"),
+        output_spec=render("output"),
+        constraints=render("constraints"),
+        samples=samples,
+        note=note,
+        url=url,
+    )
+
+
+def fetch_atc(spec, refresh=False, raw=False):
+    spec = normalize_atc(spec)
+    contest, _, suffix = spec.partition("_")
+    if not contest or not suffix:
+        raise GetProblemError(f"AtCoder: invalid task id '{spec}'")
+
+    path = cache_path("atcoder", spec, "json")
+    html = None
+    url = _atc_url(contest, suffix)
+    if path.exists() and not refresh:
+        try:
+            obj = json.loads(path.read_text(encoding="utf-8"))
+            html = obj.get("html") or None
+            url = obj.get("url") or url
+        except (OSError, ValueError):
+            html = None
+
+    if not html:
+        html, url = _atc_fetch_task(contest, suffix, suffix)
+        write_cache(
+            "atcoder", spec, json.dumps({"url": url, "html": html}), "json"
+        )
+
+    return parse_atc(html, spec, url, raw=raw)
+
+
+# --------------------------------------------------------------------------- #
+# LeetCode
+# --------------------------------------------------------------------------- #
+LC_QUERY = (
+    "query question($titleSlug: String!) { question(titleSlug: $titleSlug) "
+    "{ questionFrontendId title content isPaidOnly exampleTestcaseList } }"
+)
+_LC_EXAMPLE_HEADING_RE = re.compile(r"^example\s+\d+\s*:?\s*$", re.I)
+_LC_EXAMPLE_LINE_RE = re.compile(r"^(Input|Output|Explanation)\s*:\s*(.*)$", re.I)
+
+
+def lc_slug_map(refresh=False):
+    path = cache_path("leetcode", "all", "json")
+    if path.exists() and not refresh:
+        try:
+            if time.time() - path.stat().st_mtime < LC_LIST_TTL:
+                return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+    text = fetch_html(f"{LC_BASE}/api/problems/all/", platform="LeetCode")[0]
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise GetProblemError("LeetCode: could not fetch the problem list")
+    write_cache("leetcode", "all", text, "json")
+    return data
+
+
+def lc_slug_for_number(number, refresh=False):
+    data = lc_slug_map(refresh)
+    for pair in data.get("stat_status_pairs", []):
+        stat = pair.get("stat") or {}
+        if stat.get("frontend_question_id") == number:
+            slug = stat.get("question__title_slug")
+            if slug:
+                return slug
+    raise GetProblemError(f"LeetCode problem {number} not found")
+
+
+def lc_question(slug, refresh=False):
+    path = cache_path("leetcode", slug, "json")
+    if path.exists() and not refresh:
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Referer": f"{LC_BASE}/problems/{slug}/",
+        "User-Agent": USER_AGENT,
     }
+    body = {"query": LC_QUERY, "variables": {"titleSlug": slug}}
+    text = fetch_html(
+        f"{LC_BASE}/graphql",
+        platform="LeetCode",
+        method="POST",
+        headers=headers,
+        json_body=body,
+    )[0]
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise GetProblemError("LeetCode: invalid JSON returned by GraphQL")
+    write_cache("leetcode", slug, text, "json")
+    return data
 
 
+def parse_lc_example(text):
+    inputs, outputs, explanations = [], [], []
+    mode = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if _LC_EXAMPLE_HEADING_RE.match(stripped):
+            continue
+        match = _LC_EXAMPLE_LINE_RE.match(stripped)
+        if match:
+            mode = match.group(1).lower()
+            value = match.group(2)
+            target = {"input": inputs, "output": outputs, "explanation": explanations}[mode]
+            if value:
+                target.append(value)
+            continue
+        if mode is not None:
+            {"input": inputs, "output": outputs, "explanation": explanations}[mode].append(line)
+    return (
+        "\n".join(inputs).strip(),
+        "\n".join(outputs).strip(),
+        "\n".join(explanations).strip(),
+    )
+
+
+def split_lc_content(content):
+    soup = BeautifulSoup(content, "html.parser")
+    children = list(soup.children)
+
+    constraint_start = None
+    for i, child in enumerate(children):
+        if getattr(child, "get_text", None) and child.get_text(
+            strip=True
+        ).lower().startswith("constraints"):
+            constraint_start = i
+            break
+
+    if constraint_start is None:
+        statement_children = children
+        constraint_children = []
+    else:
+        statement_children = children[:constraint_start]
+        constraint_children = children[constraint_start + 1:]
+
+    samples = []
+    notes = []
+
+    statement_html = "".join(str(c) for c in statement_children)
+    stmt_soup = BeautifulSoup(statement_html, "html.parser")
+
+    # LeetCode uses two shapes: older examples in <pre> blocks and newer ones
+    # in <div class="example-block"> with Input/Output <p> children.
+    candidates = []
+    for el in stmt_soup.find_all(["pre", "div"]):
+        if el.name == "pre" and "input:" in raw_text(el).lower():
+            candidates.append(el)
+        elif el.name == "div" and "example-block" in (el.get("class") or []):
+            candidates.append(el)
+
+    for el in candidates:
+        if el.name == "pre":
+            raw = raw_text(el)
+        else:
+            raw = "\n".join(
+                raw_text(c) for c in el.children if getattr(c, "name", None)
+            )
+        sin, sout, explanation = parse_lc_example(raw)
+        if sin or sout:
+            samples.append((sin, sout))
+            if explanation:
+                notes.append(explanation)
+            el.decompose()
+
+    # drop leftover "Example N:" labels
+    for el in list(stmt_soup.find_all(["p", "h1", "h2", "h3", "h4", "h5", "h6", "div"])):
+        text = el.get_text(strip=True)
+        if _LC_EXAMPLE_HEADING_RE.match(text):
+            el.decompose()
+
+    statement = HtmlRenderer(
+        image_base=LC_BASE, code_backticks=True
+    ).blocks(stmt_soup).strip()
+
+    constraints = None
+    if constraint_children:
+        constraints = render_nodes(
+            constraint_children, image_base=LC_BASE, code_backticks=True
+        ) or None
+
+    note = "\n\n".join(notes) if notes else None
+    return statement, constraints, samples, note
+
+
+def fetch_lc(spec, refresh=False, raw=False):
+    slug = spec
+    if re.fullmatch(r"\d+", spec):
+        slug = lc_slug_for_number(int(spec), refresh)
+
+    data = lc_question(slug, refresh)
+    question = (data.get("data") or {}).get("question") if isinstance(data, dict) else None
+    if not question:
+        raise GetProblemError(f"LeetCode: unexpected response for '{slug}'")
+    if question.get("isPaidOnly") or not question.get("content"):
+        raise GetProblemError("LeetCode problem is premium; no content available.")
+
+    statement, constraints, samples, note = split_lc_content(question.get("content") or "")
+    title = question.get("title") or slug
+    frontend_id = str(question.get("questionFrontendId") or spec)
+
+    return Problem(
+        platform="LeetCode",
+        id=spec,
+        title=title,
+        time_limit=None,
+        memory_limit=None,
+        statement=statement,
+        input_spec=None,
+        output_spec=None,
+        constraints=constraints,
+        samples=samples,
+        note=note,
+        url=f"{LC_BASE}/problems/{slug}/",
+        frontend_id=frontend_id,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# CodeChef
+# --------------------------------------------------------------------------- #
+def parse_cc_example_pre(text):
+    parts = re.split(r"(?im)^\s*(Input|Output)\s*:?\s*$", text)
+    sin = sout = ""
+    for i in range(1, len(parts) - 1, 2):
+        marker = parts[i].lower()
+        value = parts[i + 1].strip("\n")
+        if marker == "input":
+            sin = value
+        else:
+            sout = value
+    return sin.strip("\n"), sout.strip("\n")
+
+
+def parse_cc_body(body, raw=False):
+    soup = BeautifulSoup(body or "", "html.parser")
+    sections = {}
+    current = "_top"
+    order = ["_top"]
+    for el in list(soup.children):
+        name = getattr(el, "name", None)
+        if name in ("h2", "h3"):
+            current = el.get_text(strip=True).lower()
+            if current not in sections:
+                sections[current] = []
+                order.append(current)
+            continue
+        sections.setdefault(current, []).append(el)
+
+    def render(key):
+        nodes = sections.get(key)
+        if not nodes:
+            return None
+        return render_nodes(nodes, image_base=CC_BASE, var_math=False) or None
+
+    statement = render("problem statement")
+    if not statement:
+        top = render("_top")
+        statement = top
+    constraints = render("constraints")
+    input_spec = render("input")
+    output_spec = render("output")
+
+    samples = []
+    for key in ("example", "sample input", "sample test cases", "sample input 1"):
+        nodes = sections.get(key)
+        if not nodes:
+            continue
+        example_html = "".join(str(n) for n in nodes)
+        ex_soup = BeautifulSoup(example_html, "html.parser")
+        pre = ex_soup.find("pre")
+        if pre is not None:
+            sin, sout = parse_cc_example_pre(raw_text(pre))
+            if sin or sout:
+                samples.append((sin, sout))
+        if samples:
+            break
+
+    note = render("note")
+    return statement, input_spec, output_spec, constraints, samples, note
+
+
+def parse_cc(data, code, raw=False):
+    if not isinstance(data, dict):
+        raise GetProblemError("CodeChef: unexpected response (not a JSON object)")
+    if data.get("status") == "error":
+        message = data.get("message") or "problem not found"
+        raise GetProblemError(f"CodeChef: {message}")
+
+    title = data.get("problem_name") or code
+    time_value = data.get("max_timelimit")
+    time_limit = f"{time_value} sec" if time_value else None
+
+    comps = data.get("problemComponents") or {}
+    if comps and (comps.get("statement") or comps.get("sampleTestCases")):
+        statement = (comps.get("statement") or "").strip()
+        input_spec = (comps.get("inputFormat") or "").strip() or None
+        output_spec = (comps.get("outputFormat") or "").strip() or None
+        constraints = (comps.get("constraints") or "").strip() or None
+        samples = []
+        notes = []
+        for case in comps.get("sampleTestCases") or []:
+            sin = (case.get("input") or "").rstrip("\n")
+            sout = (case.get("output") or "").rstrip("\n")
+            samples.append((sin, sout))
+            if case.get("explanation"):
+                notes.append(case["explanation"].strip())
+        note = "\n\n".join(n for n in notes if n) or None
+    else:
+        statement, input_spec, output_spec, constraints, samples, note = parse_cc_body(
+            data.get("body") or "", raw=raw
+        )
+
+    return Problem(
+        platform="CodeChef",
+        id=code,
+        title=title,
+        time_limit=time_limit,
+        memory_limit=None,
+        statement=statement,
+        input_spec=input_spec,
+        output_spec=output_spec,
+        constraints=constraints,
+        samples=samples,
+        note=note,
+        url=f"{CC_BASE}/problems/{code}",
+    )
+
+
+def fetch_cc(code, refresh=False, raw=False):
+    path = cache_path("codechef", code, "json")
+    if path.exists() and not refresh:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            text = None
+    else:
+        text = None
+
+    if text is None:
+        url = f"{CC_BASE}/api/contests/PRACTICE/problems/{code}"
+        headers = {"Accept": "application/json", "Referer": f"{CC_BASE}/problems/{code}"}
+        status, text, _final, blocked = request_raw(
+            url, platform="CodeChef", headers=headers
+        )
+        if blocked:
+            raise GetProblemError(
+                "CodeChef blocked the request (Cloudflare). "
+                "Install curl_cffi: pip install curl_cffi"
+            )
+        if status == 200 and text:
+            write_cache("codechef", code, text, "json")
+        elif not (status == 404 and text):
+            raise GetProblemError(f"CodeChef: HTTP {status} for problem {code}")
+
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise GetProblemError("CodeChef: unexpected response (invalid JSON)")
+
+    return parse_cc(data, code, raw=raw)
+
+
+# --------------------------------------------------------------------------- #
+# Formatting
+# --------------------------------------------------------------------------- #
 def render_examples(samples):
     blocks = []
     for i, (sin, sout) in enumerate(samples, 1):
@@ -365,34 +1104,50 @@ def latex_to_markdown(text):
     return re.sub(r"\$\$\$(.+?)\$\$\$", r"$\g<1>$", text, flags=re.DOTALL)
 
 
-def format_output(data, samples_only=False, raw=False):
+def format_output(problem, samples_only=False, raw=False, convert_dollars=False):
     if samples_only:
-        text = render_examples(data["samples"]) + "\n"
-        return text if raw else latex_to_markdown(text)
+        text = render_examples(problem.samples) + "\n"
+        if convert_dollars and not raw:
+            text = latex_to_markdown(text)
+        return text
 
-    parts = [f"# {data['index']} - {data['title']}"]
+    if problem.frontend_id is not None:
+        parts = [f"# {problem.frontend_id}. {problem.title}"]
+    else:
+        parts = [f"# {problem.id} - {problem.title}"]
 
-    limit = f"Time limit: {data['time_limit']} | Memory limit: {data['memory_limit']}"
-    if data["input_file"] and data["input_file"].lower() != "standard input":
-        limit += f" | Input: {data['input_file']}"
-    if data["output_file"] and data["output_file"].lower() != "standard output":
-        limit += f" | Output: {data['output_file']}"
-    parts.append(limit)
+    if problem.time_limit is not None or problem.memory_limit is not None:
+        segments = []
+        if problem.time_limit is not None:
+            segments.append(f"Time limit: {problem.time_limit}")
+        if problem.memory_limit is not None:
+            segments.append(f"Memory limit: {problem.memory_limit}")
+        limit = " | ".join(segments)
+        if problem.input_file and problem.input_file.lower() != "standard input":
+            limit += f" | Input: {problem.input_file}"
+        if problem.output_file and problem.output_file.lower() != "standard output":
+            limit += f" | Output: {problem.output_file}"
+        if limit:
+            parts.append(limit)
 
-    if data["statement"]:
-        parts.append("## Statement\n\n" + data["statement"])
-    if data["input_spec"]:
-        parts.append("## Input\n\n" + data["input_spec"])
-    if data["output_spec"]:
-        parts.append("## Output\n\n" + data["output_spec"])
-    if data["samples"]:
-        parts.append(render_examples(data["samples"]))
-    if data["note"]:
-        parts.append("## Note\n\n" + data["note"])
-    parts.append(f"URL: {data['url']}")
+    if problem.statement:
+        parts.append("## Statement\n\n" + problem.statement)
+    if problem.input_spec:
+        parts.append("## Input\n\n" + problem.input_spec)
+    if problem.constraints:
+        parts.append("## Constraints\n\n" + problem.constraints)
+    if problem.output_spec:
+        parts.append("## Output\n\n" + problem.output_spec)
+    if problem.samples:
+        parts.append(render_examples(problem.samples))
+    if problem.note:
+        parts.append("## Note\n\n" + problem.note)
+    parts.append(f"URL: {problem.url}")
 
     text = "\n\n".join(parts).rstrip() + "\n"
-    return text if raw else latex_to_markdown(text)
+    if convert_dollars and not raw:
+        text = latex_to_markdown(text)
+    return text
 
 
 # --------------------------------------------------------------------------- #
@@ -421,57 +1176,105 @@ def to_clipboard(text):
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
-ID_RE = re.compile(r"^(\d+)/?([A-Za-z]\d?)$")
+PREFIX_PLATFORMS = {
+    "cf": "codeforces",
+    "atc": "atcoder",
+    "lc": "leetcode",
+    "cc": "codechef",
+}
 
 USAGE = """usage: getproblem <id> [--print] [--stdout] [--refresh] [--samples-only] [--raw]
 
-  <id>   problem id, e.g. 1831B, 1831/B, 1800F2
+  <id>   any of:
+           1831B, 1831/B, 1800F2     Codeforces
+           abc300_a, abc300a         AtCoder
+           1, two-sum                LeetCode
+           FLOW001                   CodeChef
+           cf:1A atc:abc300a lc:two-sum cc:FLOW001   (explicit platform)
 
 options:
   --print          copy to the clipboard AND print to stdout
   --stdout         print to stdout only (no clipboard)
-  --refresh        ignore the cached HTML and re-fetch
+  --refresh        ignore the cache and re-fetch
   --samples-only   only output the sample inputs/outputs
-  --raw            keep the original $$$...$$$ math delimiters"""
+  --raw            keep original math delimiters (Codeforces/AtCoder)"""
+
+
+def detect_target(token):
+    match = re.match(r"^(cf|atc|lc|cc):(.+)$", token, re.I)
+    if match:
+        return PREFIX_PLATFORMS[match.group(1).lower()], match.group(2)
+
+    if re.match(r"^\d+/?[A-Za-z]\d?$", token):
+        return "codeforces", token
+
+    match = _ATC_RE.match(token)
+    if match and match.group(1).startswith(("abc", "arc", "agc", "ahc")):
+        return "atcoder", f"{match.group(1)}_{match.group(2)}"
+
+    if re.match(r"^\d+$", token) or re.match(r"^[a-z0-9]+(-[a-z0-9]+)+$", token):
+        return "leetcode", token
+
+    if re.match(r"^[A-Z]+\d+[A-Z]*$", token):
+        return "codechef", token
+
+    return None, None
 
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        prog="getproblem", add_help=True, description="Fetch a Codeforces problem."
+        prog="getproblem",
+        add_help=True,
+        description="Fetch a Codeforces / AtCoder / LeetCode / CodeChef problem.",
     )
-    parser.add_argument("problem", help="problem id, e.g. 1831B or 1831/B")
+    parser.add_argument("problem", help="problem id, e.g. 1831B, abc300_a, two-sum, FLOW001")
     parser.add_argument("--print", dest="also_print", action="store_true",
                         help="copy to clipboard and also print to stdout")
     parser.add_argument("--stdout", action="store_true",
                         help="print to stdout only, no clipboard")
     parser.add_argument("--refresh", action="store_true",
-                        help="bypass the HTML cache")
+                        help="bypass the cache")
     parser.add_argument("--samples-only", action="store_true",
                         help="output only the sample inputs/outputs")
     parser.add_argument("--raw", action="store_true",
-                        help="keep the original $$$...$$$ math delimiters")
+                        help="keep original math delimiters")
     return parser
+
+
+def fetch_problem_for(platform, spec, refresh=False, raw=False):
+    if platform == "codeforces":
+        return fetch_cf(spec, refresh=refresh, raw=raw)
+    if platform == "atcoder":
+        return fetch_atc(spec, refresh=refresh, raw=raw)
+    if platform == "leetcode":
+        return fetch_lc(spec, refresh=refresh, raw=raw)
+    if platform == "codechef":
+        return fetch_cc(spec, refresh=refresh, raw=raw)
+    raise GetProblemError(f"unsupported platform '{platform}'")
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
 
-    match = ID_RE.match(args.problem)
-    if not match:
+    platform, spec = detect_target(args.problem)
+    if platform is None:
         print(USAGE, file=sys.stderr)
         return 2
 
-    contest = match.group(1)
-    index = match.group(2).upper()
+    migrate_flat_cache()
 
     try:
-        html = get_page(contest, index, refresh=args.refresh)
-        data = parse_problem(html, contest, index)
+        problem = fetch_problem_for(platform, spec, refresh=args.refresh, raw=args.raw)
     except GetProblemError as exc:
         print(f"getproblem: {exc}", file=sys.stderr)
         return 1
 
-    text = format_output(data, samples_only=args.samples_only, raw=args.raw)
+    text = format_output(
+        problem,
+        samples_only=args.samples_only,
+        raw=args.raw,
+        convert_dollars=(platform == "codeforces"),
+    )
 
     if args.stdout:
         sys.stdout.write(text)
@@ -483,7 +1286,8 @@ def main(argv=None):
 
     if copied:
         print(
-            f"Copied {data['index']} - {data['title']} ({len(data['samples'])} samples)",
+            f"Copied {problem.platform} {problem.id} - {problem.title} "
+            f"({len(problem.samples)} samples)",
             file=sys.stderr,
         )
         return 0
